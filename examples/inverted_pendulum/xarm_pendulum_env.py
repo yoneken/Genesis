@@ -274,13 +274,19 @@ class XArmPendulumEnv:
             return
         num_reset = envs_idx.shape[0]
         if self.pendulum_damping_range is not None:
-            damping = self._sample_range(self.pendulum_damping_range, (num_reset, 1))
-            self.robot.set_dofs_damping(damping, dofs_idx_local=self.pendulum_dof_idx, envs_idx=envs_idx)
-            self.current_pendulum_damping[envs_idx] = damping.squeeze(-1)
+            damping = self._sample_range(self.pendulum_damping_range, (num_reset,))
+            for i in range(num_reset):
+                env_slice = envs_idx[i : i + 1]
+                self.robot.set_dofs_damping(damping[i : i + 1], dofs_idx_local=self.pendulum_dof_idx, envs_idx=env_slice)
+            self.current_pendulum_damping[envs_idx] = damping
         if self.pendulum_mass_range is not None:
-            mass = self._sample_range(self.pendulum_mass_range, (num_reset, 1))
-            self.robot.set_links_inertial_mass(mass, links_idx_local=[self.pendulum_link_idx], envs_idx=envs_idx)
-            self.current_pendulum_mass[envs_idx] = mass.squeeze(-1)
+            mass = self._sample_range(self.pendulum_mass_range, (num_reset,))
+            for i in range(num_reset):
+                env_slice = envs_idx[i : i + 1]
+                self.robot.set_links_inertial_mass(
+                    mass[i : i + 1], links_idx_local=[self.pendulum_link_idx], envs_idx=env_slice
+                )
+            self.current_pendulum_mass[envs_idx] = mass
         if self.pendulum_length_range is not None:
             length = self._sample_range(self.pendulum_length_range, (num_reset,))
             com_shift = torch.zeros((num_reset, 3), dtype=gs.tc_float, device=gs.device)

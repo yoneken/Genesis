@@ -88,7 +88,7 @@ def get_task_cfgs():
         "episode_length_s": 20.0,
         "action_scale": 0.6,
         "max_action": 1.0,
-        "kp": 200.0,
+        "kp": 600.0,
         "kd": 10.0,
         "init_joint_noise": 0.02,
         "init_pendulum_noise": 0.1,
