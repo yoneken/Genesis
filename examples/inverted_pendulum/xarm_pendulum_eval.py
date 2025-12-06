@@ -25,6 +25,7 @@ from xarm_pendulum_env import XArmPendulumEnv
 
 def load_policy(env, train_cfg, log_dir: Path, checkpoint_name: str | None):
     runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)
+    cpu_only = not torch.cuda.is_available()
     if checkpoint_name:
         checkpoint_path = log_dir / checkpoint_name
         if not checkpoint_path.exists():
@@ -34,7 +35,18 @@ def load_policy(env, train_cfg, log_dir: Path, checkpoint_name: str | None):
         if not checkpoints:
             raise FileNotFoundError(f"No checkpoint files found in {log_dir}")
         _, checkpoint_path = max(((int(re.findall(r"\d+", f.stem)[0]), f) for f in checkpoints), key=lambda tup: tup[0])
-    runner.load(checkpoint_path)
+    if cpu_only:
+        checkpoint = torch.load(checkpoint_path, map_location=torch.device("cpu"))
+        state_dict = (
+            checkpoint.get("actor_critic_state_dict")
+            or checkpoint.get("model_state_dict")
+            or checkpoint.get("module_state_dict")
+        )
+        if state_dict is None:
+            raise KeyError("Policy weights not found in checkpoint for CPU restore.")
+        runner.alg.actor_critic.load_state_dict(state_dict)
+    else:
+        runner.load(checkpoint_path)
     print(f"Loaded checkpoint {checkpoint_path}")
     return runner.get_inference_policy(device=gs.device)
 
@@ -68,7 +80,8 @@ def main():
     )
 
     policy = load_policy(env, train_cfg, log_dir, args.checkpoint)
-    policy.eval()
+    if hasattr(policy, "eval"):
+        policy.eval()
 
     obs, _ = env.reset()
     episode_returns = torch.zeros((args.num_envs,), device=gs.device)

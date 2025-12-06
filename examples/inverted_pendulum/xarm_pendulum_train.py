@@ -78,7 +78,7 @@ def get_task_cfgs():
             {"target": "joint6", "source": "joint1", "scale": 0.0, "offset": 0.0},
         ],
         "joint_limit_overrides": {
-            "joint2": [-math.pi / 6, math.pi / 6],
+            "joint2": [0, math.pi / 6],
         },
         "pendulum_joint_name": "pendulum_hinge",
         "pendulum_link_name": "pendulum",
