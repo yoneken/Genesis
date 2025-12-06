@@ -67,23 +67,24 @@ def get_train_cfg(exp_name: str, max_iterations: int):
 
 def get_task_cfgs():
     env_cfg = {
-        "num_actions": 3,
+        "num_actions": 2,
         "mjcf_file": "xml/ufactory_xarm6_pendulum/xarm6_pendulum.xml",
         "joint_names": ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"],
-        "action_joint_names": ["joint1", "joint2", "joint4"],
-        "wrist_joint_names": ["joint5", "joint6"],
+        "action_joint_names": ["joint1", "joint2"],
         "dependent_joints": [
             {"target": "joint3", "source": "joint2", "scale": -2.0},
+            {"target": "joint4", "source": "joint1", "scale": 1.0},
+            {"target": "joint5", "source": "joint2", "scale": -1.0, "offset": -math.pi / 2},
+            {"target": "joint6", "source": "joint1", "scale": 0.0, "offset": 0.0},
         ],
         "joint_limit_overrides": {
-            "joint2": [-math.pi / 4, math.pi / 4],
+            "joint2": [-math.pi / 6, math.pi / 6],
         },
         "pendulum_joint_name": "pendulum_hinge",
         "pendulum_link_name": "pendulum",
-        "wrist_link_name": "link6",
         "default_joint_pos": [0.0, 0.2, -0.2, 0.0, -1.57, 0.0],
         "default_pendulum_angle": 0.0,
-        "ctrl_dt": 0.03,
+        "ctrl_dt": 0.02,
         "episode_length_s": 20.0,
         "action_scale": 0.6,
         "max_action": 1.0,
@@ -99,7 +100,7 @@ def get_task_cfgs():
         "max_joint_velocity": math.radians(180.0),
     }
     obs_cfg = {
-        "num_obs": 21,
+        "num_obs": 20,
         "obs_scales": {
             "joint_pos": 2.0,
             "joint_vel": 0.05,

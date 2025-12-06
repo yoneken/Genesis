@@ -4,7 +4,7 @@ from typing import Dict
 import torch
 
 import genesis as gs
-from genesis.utils.geom import axis_angle_to_quat, transform_by_quat
+from genesis.utils.geom import transform_by_quat
 
 
 class XArmPendulumEnv:
@@ -80,13 +80,9 @@ class XArmPendulumEnv:
             dtype=torch.long,
             device=gs.device,
         )
-        self.wrist_joint_names = env_cfg.get("wrist_joint_names", self.joint_names[self.num_actions :])
-        self.wrist_dof_idx = torch.tensor(
-            [self.robot.get_joint(name).dofs_idx_local[0] for name in self.wrist_joint_names],
-            dtype=torch.long,
-            device=gs.device,
-        )
-        self.wrist_dof_idx_list = [int(i) for i in self.wrist_dof_idx.tolist()]
+        self.wrist_joint_names = env_cfg.get("wrist_joint_names", [])
+        self.wrist_dof_idx = torch.tensor([], dtype=torch.long, device=gs.device)
+        self.wrist_dof_idx_list = []
         self.dependent_joint_mappings = []
         for mapping in env_cfg.get("dependent_joints", []):
             target_joint = self.robot.get_joint(mapping["target"])
@@ -102,13 +98,19 @@ class XArmPendulumEnv:
         self.pendulum_joint = self.robot.get_joint(env_cfg["pendulum_joint_name"])
         self.pendulum_dof_idx = torch.tensor([self.pendulum_joint.dofs_idx_local[0]], dtype=gs.tc_int, device=gs.device)
         self.pendulum_link = self.robot.get_link(env_cfg["pendulum_link_name"])
-        self.wrist_link = self.robot.get_link(env_cfg.get("wrist_link_name", self.joint_names[-1]))
 
         self.default_joint_pos = torch.tensor(env_cfg["default_joint_pos"], dtype=gs.tc_float, device=gs.device)
         self._default_joint_pos_batched = self.default_joint_pos.unsqueeze(0).repeat(self.num_envs, 1)
         dof_lower, dof_upper = self.robot.get_dofs_limit(self.motors_dof_idx)
         self.dof_lower = dof_lower.to(gs.device)
         self.dof_upper = dof_upper.to(gs.device)
+        joint_limit_overrides = env_cfg.get("joint_limit_overrides", {})
+        if joint_limit_overrides:
+            joint_name_to_idx = {name: self.robot.get_joint(name).dofs_idx_local[0] for name in self.joint_names}
+            for joint_name, (lower, upper) in joint_limit_overrides.items():
+                idx = joint_name_to_idx[joint_name]
+                self.dof_lower[idx] = lower
+                self.dof_upper[idx] = upper
 
         kp = env_cfg.get("kp", 600.0)
         kd = env_cfg.get("kd", 60.0)
@@ -134,10 +136,6 @@ class XArmPendulumEnv:
             device=gs.device,
         ).view(1, 3)
         self.gravity_axis = torch.tensor(env_cfg.get("gravity_axis", (0.0, 0.0, 1.0)), dtype=gs.tc_float, device=gs.device)
-        wrist_axis = torch.tensor([[0.0, 1.0, 0.0]], dtype=gs.tc_float, device=gs.device)
-        wrist_angle = torch.tensor([-math.pi / 2], dtype=gs.tc_float, device=gs.device)
-        self.wrist_target_quat = axis_angle_to_quat(wrist_angle, wrist_axis)
-        self.wrist_target_quat_batch = self.wrist_target_quat.repeat(self.num_envs, 1)
 
         # reward helpers
         self.reward_functions, self.episode_sums = dict(), dict()
@@ -180,17 +178,6 @@ class XArmPendulumEnv:
         )
         desired_dof_pos[:, self.action_dof_idx] = base_target
         self._apply_dependent_joint_constraints(desired_dof_pos)
-
-        if len(self.wrist_dof_idx_list) > 0:
-            ik_solution = self.robot.inverse_kinematics(
-                link=self.wrist_link,
-                quat=self.wrist_target_quat_batch,
-                dofs_idx_local=self.wrist_dof_idx_list,
-                pos_mask=[False, False, False],
-                rot_mask=[True, True, True],
-            )
-            desired_dof_pos[:, self.wrist_dof_idx_list] = ik_solution[:, self.wrist_dof_idx_list]
-            self._apply_dependent_joint_constraints(desired_dof_pos)
 
         max_delta = self.max_joint_velocity * self.dt
         delta = torch.clamp(desired_dof_pos - self.dof_pos, -max_delta, max_delta)
