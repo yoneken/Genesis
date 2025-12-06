@@ -74,7 +74,7 @@ def get_task_cfgs():
         "dependent_joints": [
             {"target": "joint3", "source": "joint2", "scale": -2.0},
             {"target": "joint4", "source": "joint1", "scale": 1.0},
-            {"target": "joint5", "source": "joint2", "scale": -1.0, "offset": -math.pi / 2},
+            {"target": "joint5", "source": "joint2", "scale": 1.0, "offset": -math.pi / 2},
             {"target": "joint6", "source": "joint1", "scale": 0.0, "offset": 0.0},
         ],
         "joint_limit_overrides": {
@@ -98,6 +98,11 @@ def get_task_cfgs():
         "gravity_axis": (0.0, 0.0, 1.0),
         "sim_substeps": 2,
         "max_joint_velocity": math.radians(180.0),
+        "simulate_action_latency": True,
+        "pendulum_damping_range": [1e-7, 1e-3],
+        "pendulum_mass_range": [0.05, 0.25],
+        "pendulum_length_range": [0.9, 1.1],
+        "pendulum_nominal_length": 1.0,
     }
     obs_cfg = {
         "num_obs": 20,

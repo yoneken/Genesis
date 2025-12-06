@@ -33,6 +33,7 @@ class XArmPendulumEnv:
         self.init_pendulum_noise = env_cfg.get("init_pendulum_noise", 0.1)
         self.default_pendulum_angle = env_cfg.get("default_pendulum_angle", 0.0)
         self.termination_cos_threshold = env_cfg.get("termination_cos_threshold", 0.4)
+        self.simulate_action_latency = env_cfg.get("simulate_action_latency", True)
 
         # === scene ===
         self.scene = gs.Scene(
@@ -98,6 +99,7 @@ class XArmPendulumEnv:
         self.pendulum_joint = self.robot.get_joint(env_cfg["pendulum_joint_name"])
         self.pendulum_dof_idx = torch.tensor([self.pendulum_joint.dofs_idx_local[0]], dtype=gs.tc_int, device=gs.device)
         self.pendulum_link = self.robot.get_link(env_cfg["pendulum_link_name"])
+        self.pendulum_link_idx = self.pendulum_link.idx_local
 
         self.default_joint_pos = torch.tensor(env_cfg["default_joint_pos"], dtype=gs.tc_float, device=gs.device)
         self._default_joint_pos_batched = self.default_joint_pos.unsqueeze(0).repeat(self.num_envs, 1)
@@ -136,6 +138,9 @@ class XArmPendulumEnv:
             device=gs.device,
         ).view(1, 3)
         self.gravity_axis = torch.tensor(env_cfg.get("gravity_axis", (0.0, 0.0, 1.0)), dtype=gs.tc_float, device=gs.device)
+        self.pendulum_damping_range = self._parse_range(env_cfg.get("pendulum_damping_range"))
+        self.pendulum_mass_range = self._parse_range(env_cfg.get("pendulum_mass_range"))
+        self.pendulum_length_range = self._parse_range(env_cfg.get("pendulum_length_range"))
 
         # reward helpers
         self.reward_functions, self.episode_sums = dict(), dict()
@@ -153,6 +158,21 @@ class XArmPendulumEnv:
         self.tip_alignment = torch.zeros((self.num_envs,), dtype=gs.tc_float, device=gs.device)
         self.tilt_squared = torch.zeros_like(self.tip_alignment)
         self.pendulum_axis_speed = torch.zeros_like(self.tip_alignment)
+        self.current_pendulum_length = torch.full(
+            (self.num_envs,), env_cfg.get("pendulum_nominal_length", 1.0), dtype=gs.tc_float, device=gs.device
+        )
+        self.current_pendulum_mass = torch.full(
+            (self.num_envs,),
+            self.robot.get_links_inertial_mass(links_idx_local=[self.pendulum_link_idx]).squeeze().item(),
+            dtype=gs.tc_float,
+            device=gs.device,
+        )
+        self.current_pendulum_damping = torch.full(
+            (self.num_envs,),
+            self.robot.get_dofs_damping(self.pendulum_dof_idx).squeeze().item(),
+            dtype=gs.tc_float,
+            device=gs.device,
+        )
         self.actions = torch.zeros((self.num_envs, self.num_actions), dtype=gs.tc_float, device=gs.device)
         self.last_actions = torch.zeros_like(self.actions)
         self.obs_buf = torch.zeros((self.num_envs, self.num_obs), dtype=gs.tc_float, device=gs.device)
@@ -171,8 +191,9 @@ class XArmPendulumEnv:
         self.actions = actions
 
         desired_dof_pos = self.dof_pos.clone()
+        commanded_actions = self.last_actions if self.simulate_action_latency else self.actions
         base_target = torch.clamp(
-            self._default_joint_pos_batched[:, self.action_dof_idx] + actions * self.action_scale,
+            self._default_joint_pos_batched[:, self.action_dof_idx] + commanded_actions * self.action_scale,
             self.dof_lower[self.action_dof_idx],
             self.dof_upper[self.action_dof_idx],
         )
@@ -227,6 +248,20 @@ class XArmPendulumEnv:
     # --------------------------------------------------------------------- #
     # Helpers
     # --------------------------------------------------------------------- #
+    def _parse_range(self, value):
+        if value is None:
+            return None
+        low, high = float(value[0]), float(value[1])
+        if low > high:
+            low, high = high, low
+        return low, high
+
+    def _sample_range(self, rng, shape):
+        if rng is None:
+            return None
+        low, high = rng
+        return torch.rand(shape, device=gs.device, dtype=gs.tc_float) * (high - low) + low
+
     def _apply_dependent_joint_constraints(self, joint_tensor: torch.Tensor):
         if not self.dependent_joint_mappings:
             return joint_tensor
@@ -234,11 +269,32 @@ class XArmPendulumEnv:
             joint_tensor[..., target_idx] = joint_tensor[..., source_idx] * scale + offset
         return joint_tensor
 
+    def _randomize_pendulum(self, envs_idx: torch.Tensor):
+        if envs_idx.numel() == 0:
+            return
+        num_reset = envs_idx.shape[0]
+        if self.pendulum_damping_range is not None:
+            damping = self._sample_range(self.pendulum_damping_range, (num_reset, 1))
+            self.robot.set_dofs_damping(damping, dofs_idx_local=self.pendulum_dof_idx, envs_idx=envs_idx)
+            self.current_pendulum_damping[envs_idx] = damping.squeeze(-1)
+        if self.pendulum_mass_range is not None:
+            mass = self._sample_range(self.pendulum_mass_range, (num_reset, 1))
+            self.robot.set_links_inertial_mass(mass, links_idx_local=[self.pendulum_link_idx], envs_idx=envs_idx)
+            self.current_pendulum_mass[envs_idx] = mass.squeeze(-1)
+        if self.pendulum_length_range is not None:
+            length = self._sample_range(self.pendulum_length_range, (num_reset,))
+            com_shift = torch.zeros((num_reset, 3), dtype=gs.tc_float, device=gs.device)
+            com_shift[:, 0] = length / 2.0
+            self.robot.set_COM_shift(com_shift, links_idx_local=[self.pendulum_link_idx], envs_idx=envs_idx)
+            self.current_pendulum_length[envs_idx] = length
+
     def reset_idx(self, envs_idx: torch.Tensor):
         if envs_idx.numel() == 0:
             return
         envs_idx = envs_idx.to(dtype=torch.long)
         num_reset = envs_idx.shape[0]
+
+        self._randomize_pendulum(envs_idx)
 
         # reset robot joints
         joint_noise = (2.0 * torch.rand((num_reset, self.arm_num_dofs), dtype=gs.tc_float, device=gs.device) - 1.0)
