@@ -4,7 +4,7 @@ from typing import Dict
 import torch
 
 import genesis as gs
-from genesis.utils.geom import transform_by_quat
+from genesis.utils.geom import axis_angle_to_quat, transform_by_quat
 
 
 class XArmPendulumEnv:
@@ -47,8 +47,8 @@ class XArmPendulumEnv:
                 enable_joint_limit=True,
             ),
             viewer_options=gs.options.ViewerOptions(
-                camera_pos=(1.5, 0.0, 1.5),
-                camera_lookat=(0.0, 0.0, 0.5),
+                camera_pos=(1.0, -0.8, 0.4),
+                camera_lookat=(0.0, 0.0, 0.4),
                 camera_fov=38,
                 max_FPS=int(1.0 / self.dt),
             ),
@@ -65,14 +65,44 @@ class XArmPendulumEnv:
 
         # === robot handles ===
         self.joint_names = env_cfg["joint_names"]
+        self.arm_num_dofs = len(self.joint_names)
         self.motors_dof_idx = torch.tensor(
             [self.robot.get_joint(name).dofs_idx_local[0] for name in self.joint_names],
             dtype=gs.tc_int,
             device=gs.device,
         )
+        self.action_joint_names = env_cfg.get("action_joint_names", self.joint_names[: self.num_actions])
+        assert (
+            len(self.action_joint_names) == self.num_actions
+        ), "Number of action joints must match num_actions in config."
+        self.action_dof_idx = torch.tensor(
+            [self.robot.get_joint(name).dofs_idx_local[0] for name in self.action_joint_names],
+            dtype=torch.long,
+            device=gs.device,
+        )
+        self.wrist_joint_names = env_cfg.get("wrist_joint_names", self.joint_names[self.num_actions :])
+        self.wrist_dof_idx = torch.tensor(
+            [self.robot.get_joint(name).dofs_idx_local[0] for name in self.wrist_joint_names],
+            dtype=torch.long,
+            device=gs.device,
+        )
+        self.wrist_dof_idx_list = [int(i) for i in self.wrist_dof_idx.tolist()]
+        self.dependent_joint_mappings = []
+        for mapping in env_cfg.get("dependent_joints", []):
+            target_joint = self.robot.get_joint(mapping["target"])
+            source_joint = self.robot.get_joint(mapping["source"])
+            self.dependent_joint_mappings.append(
+                (
+                    int(target_joint.dofs_idx_local[0]),
+                    int(source_joint.dofs_idx_local[0]),
+                    float(mapping.get("scale", 1.0)),
+                    float(mapping.get("offset", 0.0)),
+                )
+            )
         self.pendulum_joint = self.robot.get_joint(env_cfg["pendulum_joint_name"])
         self.pendulum_dof_idx = torch.tensor([self.pendulum_joint.dofs_idx_local[0]], dtype=gs.tc_int, device=gs.device)
         self.pendulum_link = self.robot.get_link(env_cfg["pendulum_link_name"])
+        self.wrist_link = self.robot.get_link(env_cfg.get("wrist_link_name", self.joint_names[-1]))
 
         self.default_joint_pos = torch.tensor(env_cfg["default_joint_pos"], dtype=gs.tc_float, device=gs.device)
         self._default_joint_pos_batched = self.default_joint_pos.unsqueeze(0).repeat(self.num_envs, 1)
@@ -83,9 +113,13 @@ class XArmPendulumEnv:
         kp = env_cfg.get("kp", 600.0)
         kd = env_cfg.get("kd", 60.0)
         if isinstance(kp, (int, float)):
-            kp = [kp] * self.num_actions
+            kp = [kp] * self.arm_num_dofs
+        else:
+            assert len(kp) == self.arm_num_dofs, "Length of kp gains must match number of controllable joints."
         if isinstance(kd, (int, float)):
-            kd = [kd] * self.num_actions
+            kd = [kd] * self.arm_num_dofs
+        else:
+            assert len(kd) == self.arm_num_dofs, "Length of kd gains must match number of controllable joints."
         self.robot.set_dofs_kp(kp, self.motors_dof_idx)
         self.robot.set_dofs_kv(kd, self.motors_dof_idx)
 
@@ -100,6 +134,10 @@ class XArmPendulumEnv:
             device=gs.device,
         ).view(1, 3)
         self.gravity_axis = torch.tensor(env_cfg.get("gravity_axis", (0.0, 0.0, 1.0)), dtype=gs.tc_float, device=gs.device)
+        wrist_axis = torch.tensor([[0.0, 1.0, 0.0]], dtype=gs.tc_float, device=gs.device)
+        wrist_angle = torch.tensor([-math.pi / 2], dtype=gs.tc_float, device=gs.device)
+        self.wrist_target_quat = axis_angle_to_quat(wrist_angle, wrist_axis)
+        self.wrist_target_quat_batch = self.wrist_target_quat.repeat(self.num_envs, 1)
 
         # reward helpers
         self.reward_functions, self.episode_sums = dict(), dict()
@@ -109,7 +147,7 @@ class XArmPendulumEnv:
             self.episode_sums[name] = torch.zeros((self.num_envs,), dtype=gs.tc_float, device=gs.device)
 
         # === buffers ===
-        self.dof_pos = torch.zeros((self.num_envs, self.num_actions), dtype=gs.tc_float, device=gs.device)
+        self.dof_pos = torch.zeros((self.num_envs, self.arm_num_dofs), dtype=gs.tc_float, device=gs.device)
         self.dof_vel = torch.zeros_like(self.dof_pos)
         self.pendulum_joint_pos = torch.zeros((self.num_envs,), dtype=gs.tc_float, device=gs.device)
         self.pendulum_joint_vel = torch.zeros_like(self.pendulum_joint_pos)
@@ -134,11 +172,28 @@ class XArmPendulumEnv:
         actions = torch.clamp(actions, -self.max_action, self.max_action)
         self.actions = actions
 
-        target_dof_pos = self._default_joint_pos_batched + actions * self.action_scale
-        target_dof_pos = torch.clamp(target_dof_pos, self.dof_lower, self.dof_upper)
+        desired_dof_pos = self.dof_pos.clone()
+        base_target = torch.clamp(
+            self._default_joint_pos_batched[:, self.action_dof_idx] + actions * self.action_scale,
+            self.dof_lower[self.action_dof_idx],
+            self.dof_upper[self.action_dof_idx],
+        )
+        desired_dof_pos[:, self.action_dof_idx] = base_target
+        self._apply_dependent_joint_constraints(desired_dof_pos)
+
+        if len(self.wrist_dof_idx_list) > 0:
+            ik_solution = self.robot.inverse_kinematics(
+                link=self.wrist_link,
+                quat=self.wrist_target_quat_batch,
+                dofs_idx_local=self.wrist_dof_idx_list,
+                pos_mask=[False, False, False],
+                rot_mask=[True, True, True],
+            )
+            desired_dof_pos[:, self.wrist_dof_idx_list] = ik_solution[:, self.wrist_dof_idx_list]
+            self._apply_dependent_joint_constraints(desired_dof_pos)
 
         max_delta = self.max_joint_velocity * self.dt
-        delta = torch.clamp(target_dof_pos - self.dof_pos, -max_delta, max_delta)
+        delta = torch.clamp(desired_dof_pos - self.dof_pos, -max_delta, max_delta)
         command_pos = torch.clamp(self.dof_pos + delta, self.dof_lower, self.dof_upper)
 
         self.robot.control_dofs_position(command_pos, self.motors_dof_idx)
@@ -185,6 +240,13 @@ class XArmPendulumEnv:
     # --------------------------------------------------------------------- #
     # Helpers
     # --------------------------------------------------------------------- #
+    def _apply_dependent_joint_constraints(self, joint_tensor: torch.Tensor):
+        if not self.dependent_joint_mappings:
+            return joint_tensor
+        for target_idx, source_idx, scale, offset in self.dependent_joint_mappings:
+            joint_tensor[..., target_idx] = joint_tensor[..., source_idx] * scale + offset
+        return joint_tensor
+
     def reset_idx(self, envs_idx: torch.Tensor):
         if envs_idx.numel() == 0:
             return
@@ -192,12 +254,13 @@ class XArmPendulumEnv:
         num_reset = envs_idx.shape[0]
 
         # reset robot joints
-        joint_noise = (2.0 * torch.rand((num_reset, self.num_actions), dtype=gs.tc_float, device=gs.device) - 1.0)
+        joint_noise = (2.0 * torch.rand((num_reset, self.arm_num_dofs), dtype=gs.tc_float, device=gs.device) - 1.0)
         joint_target = torch.clamp(
             self._default_joint_pos_batched[envs_idx] + joint_noise * self.init_joint_noise,
             self.dof_lower,
             self.dof_upper,
         )
+        self._apply_dependent_joint_constraints(joint_target)
         self.robot.set_dofs_position(joint_target, dofs_idx_local=self.motors_dof_idx, envs_idx=envs_idx)
         self.dof_pos[envs_idx] = joint_target
         self.dof_vel[envs_idx] = 0.0
