@@ -51,9 +51,9 @@ class KeyboardDevice:
 
 def apply_dependent_rules(joint_vec: np.ndarray):
     joint_vec[2] = -2.0 * joint_vec[1]
-    joint_vec[3] = joint_vec[0]
-    joint_vec[4] = joint_vec[1] - math.pi / 2.0
-    joint_vec[5] = 0.0
+    joint_vec[3] = joint_vec[0] + math.pi / 2.0
+    joint_vec[4] = - math.pi / 2.0
+    joint_vec[5] = - joint_vec[1]
     return joint_vec
 
 

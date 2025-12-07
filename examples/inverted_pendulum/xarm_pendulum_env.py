@@ -48,7 +48,7 @@ class XArmPendulumEnv:
                 enable_joint_limit=True,
             ),
             viewer_options=gs.options.ViewerOptions(
-                camera_pos=(1.0, -0.8, 0.4),
+                camera_pos=(-0.5, -1.0, 0.4),
                 camera_lookat=(0.0, 0.0, 0.4),
                 camera_fov=38,
                 max_FPS=int(1.0 / self.dt),
