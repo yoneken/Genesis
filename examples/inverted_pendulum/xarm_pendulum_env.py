@@ -141,6 +141,19 @@ class XArmPendulumEnv:
         self.pendulum_damping_range = self._parse_range(env_cfg.get("pendulum_damping_range"))
         self.pendulum_mass_range = self._parse_range(env_cfg.get("pendulum_mass_range"))
         self.pendulum_length_range = self._parse_range(env_cfg.get("pendulum_length_range"))
+        self.action_center_ranges = {}
+        ranges_cfg = env_cfg.get("action_center_ranges")
+        if isinstance(ranges_cfg, dict):
+            for joint_name, rng in ranges_cfg.items():
+                parsed = self._parse_range(rng)
+                joint_idx = self.robot.get_joint(joint_name).dofs_idx_local[0]
+                self.action_center_ranges[joint_idx] = parsed
+        elif ranges_cfg is not None:
+            parsed = self._parse_range(ranges_cfg)
+            for idx in self.action_dof_idx.tolist():
+                self.action_center_ranges[int(idx)] = parsed
+        self.action_center_penalty = env_cfg.get("action_center_penalty", 1.0)
+        self.action_center_sigma = max(env_cfg.get("action_center_sigma", 0.1), 1e-6)
 
         # reward helpers
         self.reward_functions, self.episode_sums = dict(), dict()
@@ -396,3 +409,19 @@ class XArmPendulumEnv:
 
     def _reward_pendulum_velocity(self):
         return torch.square(self.pendulum_axis_speed)
+
+    def _reward_action_center(self):
+        if not self.action_center_ranges:
+            return torch.zeros((self.num_envs,), dtype=gs.tc_float, device=gs.device)
+        rewards = torch.zeros((self.num_envs,), dtype=gs.tc_float, device=gs.device)
+        for idx, rng in self.action_center_ranges.items():
+            joint_pos = self.dof_pos[:, idx]
+            target = self.default_joint_pos[idx]
+            deviation = torch.abs(joint_pos - target)
+            rewards += torch.exp(-deviation / self.action_center_sigma)
+            if rng is not None:
+                low, high = rng
+                below = torch.clamp(low - joint_pos, min=0.0)
+                above = torch.clamp(joint_pos - high, min=0.0)
+                rewards -= self.action_center_penalty * (below + above)
+        return rewards
