@@ -35,7 +35,6 @@ def run_pd(args):
         show_viewer=args.vis,
     )
 
-    obs, _ = env.reset()
     target_angle = torch.full(
         (env.num_envs,),
         math.radians(args.target_angle_deg),
@@ -49,44 +48,79 @@ def run_pd(args):
 
     print(
         f"Starting PD control with kp={args.kp:.2f}, kd={args.kd:.2f}, "
-        f"target={args.target_angle_deg:.1f} deg, max_time={args.max_time_s}s"
+        f"target={args.target_angle_deg:.1f} deg, max_time={args.max_time_s}s, "
+        f"max_retries={args.max_retries}"
     )
 
-    step_count = 0
-    sim_start = time.time()
-    try:
-        while step_count < max_steps:
-            angle_error = target_angle - env.pendulum_joint_pos
-            control = args.kp * angle_error - args.kd * env.pendulum_joint_vel
-            if max_joint_delta is not None:
-                control = torch.clamp(control, -max_joint_delta, max_joint_delta)
-            actions = torch.clamp(control / env.action_scale, -env.max_action, env.max_action).unsqueeze(-1)
+    attempt = 0
+    while attempt <= args.max_retries:
+        obs, _ = env.reset()
+        step_count = 0
+        sim_start = time.time()
+        try:
+            while step_count < max_steps:
+                angle_error = target_angle - env.pendulum_joint_pos
+                # Classic PD: derivative term opposes velocity.
+                control = args.kp * angle_error - args.kd * env.pendulum_joint_vel
+                if max_joint_delta is not None:
+                    control = torch.clamp(control, -max_joint_delta, max_joint_delta)
+                actions = torch.clamp(control / env.action_scale, -env.max_action, env.max_action).unsqueeze(-1)
 
-            obs, reward, done, extras = env.step(actions)
+                obs, reward, done, extras = env.step(actions)
 
-            if args.log_interval > 0 and step_count % args.log_interval == 0:
-                avg_tip = env.tip_alignment.mean().item()
-                avg_angle = env.pendulum_joint_pos.mean().item()
-                avg_joint = env.dof_pos[:, env.action_dof_idx[0]].mean().item()
-                print(
-                    f"[step {step_count:06d}] "
-                    f"pendulum={avg_angle:+.4f} rad ({math.degrees(avg_angle):+.2f} deg), "
-                    f"tip_align={avg_tip:+.3f}, joint2={avg_joint:+.3f} rad, "
-                    f"reward={reward.mean().item():+.3f}"
-                )
+                if args.log_interval > 0 and step_count % args.log_interval == 0:
+                    avg_tip = env.tip_alignment.mean().item()
+                    avg_angle = env.pendulum_joint_pos.mean().item()
+                    avg_joint = env.dof_pos[:, env.action_dof_idx[0]].mean().item()
+                    print(
+                        f"[step {step_count:06d}] "
+                        f"pendulum={avg_angle:+.4f} rad ({math.degrees(avg_angle):+.2f} deg), "
+                        f"tip_align={avg_tip:+.3f}, joint2={avg_joint:+.3f} rad, "
+                        f"reward={reward.mean().item():+.3f}"
+                    )
 
-            step_count += 1
-    except KeyboardInterrupt:
-        print("Interrupted by user, shutting down PD test.")
-    finally:
-        elapsed = time.time() - sim_start
-        print(f"Simulated {step_count} steps in {elapsed:.2f} s (avg {step_count * env.dt:.2f} s of simulation time).")
+                if torch.any(done):
+                    timeout_mask = extras.get("time_outs")
+                    timeouts = int((timeout_mask > 0.5).sum().item()) if timeout_mask is not None else 0
+                    total_done = int(done.sum().item())
+                    falls = total_done - timeouts
+                    reason_parts = []
+                    if timeouts:
+                        reason_parts.append(f"timeout {timeouts}")
+                    if falls:
+                        reason_parts.append(f"fell {falls}")
+                    reason = "; ".join(reason_parts) or "unknown"
+                    print(f"Termination detected at step {step_count}: {reason}. Exiting.")
+                    break
+
+                step_count += 1
+        except KeyboardInterrupt:
+            print("Interrupted by user, shutting down PD test.")
+            break
+        finally:
+            elapsed = time.time() - sim_start
+            print(
+                f"Simulated {step_count} steps in {elapsed:.2f} s "
+                f"(avg {step_count * env.dt:.2f} s of simulation time) on attempt {attempt + 1}."
+            )
+
+        # Stop on termination or max steps; only retry if explicitly requested and not terminated.
+        if torch.any(done):
+            break
+        if step_count >= max_steps:
+            print("Reached max steps; stopping without automatic rerun.")
+            break
+        attempt += 1
+        if attempt > args.max_retries:
+            print("Max retries exhausted; stopping.")
+            break
+        print(f"Retrying PD control (attempt {attempt + 1}/{args.max_retries + 1}) after timeout.")
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="PD controller experiment for the xArm inverted pendulum.")
     parser.add_argument("--kp", type=float, default=6.0, help="P gain applied to pendulum angle error (rad).")
-    parser.add_argument("--kd", type=float, default=1.0, help="D gain applied to pendulum angular velocity.")
+    parser.add_argument("--kd", type=float, default=0.5, help="D gain applied to pendulum angular velocity.")
     parser.add_argument("--target_angle_deg", type=float, default=0.0, help="Pendulum target angle in degrees.")
     parser.add_argument("--max_joint_delta_deg", type=float, default=30.0, help="Clamp per-step joint delta (deg).")
     parser.add_argument("--num_envs", type=int, default=4, help="Number of parallel environments.")
@@ -95,6 +129,12 @@ def parse_args():
     parser.add_argument("--logging", type=str, default="warning", help="Genesis logging level.")
     parser.add_argument("-v", "--vis", action="store_true", help="Show viewer.")
     parser.add_argument("--log_interval", type=int, default=200, help="Print status every N steps.")
+    parser.add_argument(
+        "--max_retries",
+        type=int,
+        default=0,
+        help="Number of additional runs to attempt after a failure or timeout.",
+    )
     parser.add_argument(
         "--disable_randomization",
         action="store_true",

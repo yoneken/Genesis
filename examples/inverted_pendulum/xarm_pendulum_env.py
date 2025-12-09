@@ -10,7 +10,9 @@ from genesis.utils.geom import transform_by_quat
 class XArmPendulumEnv:
     """Parallel RL environment for balancing the pendulum with the UFactory xArm6."""
 
-    def __init__(self, num_envs: int, env_cfg: Dict, obs_cfg: Dict, reward_cfg: Dict, show_viewer: bool = False) -> None:
+    def __init__(
+        self, num_envs: int, env_cfg: Dict, obs_cfg: Dict, reward_cfg: Dict, show_viewer: bool = False
+    ) -> None:
         self.num_envs = num_envs
         self.num_obs = obs_cfg["num_obs"]
         self.num_privileged_obs = None
@@ -46,7 +48,7 @@ class XArmPendulumEnv:
                 constraint_solver=gs.constraint_solver.Newton,
                 enable_collision=True,
                 enable_joint_limit=True,
-                gravity=(0, 0, -9.8)
+                gravity=(0, 0, -1.8),
             ),
             viewer_options=gs.options.ViewerOptions(
                 camera_pos=(-0.5, -1.0, 0.4),
@@ -134,11 +136,13 @@ class XArmPendulumEnv:
             device=gs.device,
         ).view(1, 3)
         self.hinge_axis_local = torch.tensor(
-            env_cfg.get("pendulum_hinge_axis_local", (0.0, 0.0, 1.0)),
+            env_cfg.get("pendulum_hinge_axis_local", (1.0, 0.0, 0.0)),
             dtype=gs.tc_float,
             device=gs.device,
         ).view(1, 3)
-        self.gravity_axis = torch.tensor(env_cfg.get("gravity_axis", (0.0, 0.0, 1.0)), dtype=gs.tc_float, device=gs.device)
+        self.gravity_axis = torch.tensor(
+            env_cfg.get("gravity_axis", (0.0, 0.0, 1.0)), dtype=gs.tc_float, device=gs.device
+        )
         self.pendulum_damping_range = self._parse_range(env_cfg.get("pendulum_damping_range"))
         self.pendulum_mass_range = self._parse_range(env_cfg.get("pendulum_mass_range"))
         self.pendulum_length_range = self._parse_range(env_cfg.get("pendulum_length_range"))
@@ -234,10 +238,13 @@ class XArmPendulumEnv:
 
         time_out = self.episode_length_buf >= self.max_episode_length
         fell_over = self.tip_alignment < self.termination_cos_threshold
-        self.reset_buf = time_out | fell_over
+        done = time_out | fell_over
+        done_out = done.clone()
+        self.reset_buf = done
 
         self.extras["time_outs"] = torch.zeros_like(self.rew_buf, dtype=gs.tc_float, device=gs.device)
         self.extras["time_outs"][time_out & ~fell_over] = 1.0
+        self.extras["done_mask"] = done_out
 
         reset_envs = torch.nonzero(self.reset_buf, as_tuple=False).squeeze(-1)
         self.reset_idx(reset_envs)
@@ -245,7 +252,7 @@ class XArmPendulumEnv:
         self.last_actions.copy_(self.actions)
         self.extras["observations"]["critic"] = self.obs_buf
 
-        return self.obs_buf, self.rew_buf, self.reset_buf, self.extras
+        return self.obs_buf, self.rew_buf, done_out, self.extras
 
     def reset(self):
         self.reset_buf[:] = True
@@ -291,7 +298,9 @@ class XArmPendulumEnv:
             damping = self._sample_range(self.pendulum_damping_range, (num_reset,))
             for i in range(num_reset):
                 env_slice = envs_idx[i : i + 1]
-                self.robot.set_dofs_damping(damping[i : i + 1], dofs_idx_local=self.pendulum_dof_idx, envs_idx=env_slice)
+                self.robot.set_dofs_damping(
+                    damping[i : i + 1], dofs_idx_local=self.pendulum_dof_idx, envs_idx=env_slice
+                )
             self.current_pendulum_damping[envs_idx] = damping
         if self.pendulum_mass_range is not None:
             mass = self._sample_range(self.pendulum_mass_range, (num_reset,))
@@ -317,7 +326,7 @@ class XArmPendulumEnv:
         self._randomize_pendulum(envs_idx)
 
         # reset robot joints
-        joint_noise = (2.0 * torch.rand((num_reset, self.arm_num_dofs), dtype=gs.tc_float, device=gs.device) - 1.0)
+        joint_noise = 2.0 * torch.rand((num_reset, self.arm_num_dofs), dtype=gs.tc_float, device=gs.device) - 1.0
         joint_target = torch.clamp(
             self._default_joint_pos_batched[envs_idx] + joint_noise * self.init_joint_noise,
             self.dof_lower,
@@ -339,9 +348,7 @@ class XArmPendulumEnv:
         pendulum_quat = self.pendulum_link.get_quat(envs_idx=envs_idx)
         axis = self.pendulum_axis_local.expand(num_reset, -1)
         self.pendulum_dir[envs_idx] = transform_by_quat(axis, pendulum_quat)
-        self.tip_alignment[envs_idx] = torch.sum(
-            self.pendulum_dir[envs_idx] * self.gravity_axis.view(1, 3), dim=1
-        )
+        self.tip_alignment[envs_idx] = torch.sum(self.pendulum_dir[envs_idx] * self.gravity_axis.view(1, 3), dim=1)
         self.tilt_squared[envs_idx] = torch.clamp(1.0 - torch.square(self.tip_alignment[envs_idx]), min=0.0, max=1.0)
 
         self.last_actions[envs_idx] = 0.0
