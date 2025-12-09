@@ -46,6 +46,7 @@ class XArmPendulumEnv:
                 constraint_solver=gs.constraint_solver.Newton,
                 enable_collision=True,
                 enable_joint_limit=True,
+                gravity=(0, 0, -9.8)
             ),
             viewer_options=gs.options.ViewerOptions(
                 camera_pos=(-0.5, -1.0, 0.4),
