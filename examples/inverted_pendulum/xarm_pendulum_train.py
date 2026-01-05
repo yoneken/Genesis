@@ -92,7 +92,8 @@ def get_task_cfgs():
         "default_pendulum_angle": 0.0,
         "ctrl_dt": 0.01,
         "episode_length_s": 20.0,
-        "action_scale": 0.6,
+        # Map action in [-1,1] directly to joint velocities in [-180 deg/s, 180 deg/s]
+        "action_scale": math.radians(180.0),
         "max_action": 1.0,
         "kp": 600.0,
         "kd": 30.0,
@@ -104,7 +105,7 @@ def get_task_cfgs():
         "pendulum_hinge_axis_local": (1.0, 0.0, 0.0),
         "gravity_axis": (0.0, 0.0, 1.0),
         "sim_substeps": 2,
-        "max_joint_velocity": math.radians(720.0),
+        "max_joint_velocity": math.radians(180.0),
         "simulate_action_latency": False,
         "pendulum_damping_range": [1e-7, 1e-3],
         "pendulum_mass_range": [0.05, 0.25],

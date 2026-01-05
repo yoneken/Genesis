@@ -48,7 +48,7 @@ class XArmPendulumEnv:
                 constraint_solver=gs.constraint_solver.Newton,
                 enable_collision=True,
                 enable_joint_limit=True,
-                gravity=(0, 0, -1.8),
+                gravity=(0, 0, -9.8),
             ),
             viewer_options=gs.options.ViewerOptions(
                 camera_pos=(-0.5, -1.0, 0.4),
@@ -205,24 +205,20 @@ class XArmPendulumEnv:
     # RL API
     # --------------------------------------------------------------------- #
     def step(self, actions: torch.Tensor):
+        # Interpret incoming actions as joint velocity commands on action joints.
         actions = torch.clamp(actions, -self.max_action, self.max_action)
         self.actions = actions
 
-        desired_dof_pos = self.dof_pos.clone()
         commanded_actions = self.last_actions if self.simulate_action_latency else self.actions
-        base_target = torch.clamp(
-            self._default_joint_pos_batched[:, self.action_dof_idx] + commanded_actions * self.action_scale,
-            self.dof_lower[self.action_dof_idx],
-            self.dof_upper[self.action_dof_idx],
-        )
-        desired_dof_pos[:, self.action_dof_idx] = base_target
-        self._apply_dependent_joint_constraints(desired_dof_pos)
+        # Scale to physical velocity and clamp
+        desired_vel = torch.zeros_like(self.dof_vel)
+        vel_cmd = torch.clamp(commanded_actions * self.action_scale, -self.max_joint_velocity, self.max_joint_velocity)
+        desired_vel[:, self.action_dof_idx] = vel_cmd
+        # Apply dependent joint constraints for velocities (scale only, ignore offsets)
+        for target_idx, source_idx, scale, _ in self.dependent_joint_mappings:
+            desired_vel[..., target_idx] = desired_vel[..., source_idx] * scale
 
-        max_delta = self.max_joint_velocity * self.dt
-        delta = torch.clamp(desired_dof_pos - self.dof_pos, -max_delta, max_delta)
-        command_pos = torch.clamp(self.dof_pos + delta, self.dof_lower, self.dof_upper)
-
-        self.robot.control_dofs_position(command_pos, self.motors_dof_idx)
+        self.robot.control_dofs_velocity(desired_vel, self.motors_dof_idx)
 
         self.scene.step()
         self.episode_length_buf += 1
